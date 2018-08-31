@@ -1,10 +1,11 @@
 import discord as dis
 from fuzzywuzzy import fuzz
 from squad_rcon.commands import commands
-from server_config import call_string, debug_channels
+from server_config import call_string, debug_channels, vote_channel_id, vote_channel_header, premium_vote_roles
 import re
 from miscellaneous.misc import is_steamid64, str_to_epoch, epoch_from_now
 from discord_bot.parse_channel_file import *
+from server_scripts.vote_map import VoteError
 
 
 def scrub_input(content):
@@ -56,7 +57,7 @@ async def set_ban(self, last_message):
     steamid64 = content[1]
     if is_steamid64(steamid64):
         if content[2].lower() == 'remove':
-            self.server.set_ban(steamid64, remove=True)
+            await self.server_files.set_ban(steamid64, remove=True)
         else:
             if content[2] == '0':
                 time_stamp = 0
@@ -64,7 +65,7 @@ async def set_ban(self, last_message):
                 time_stamp = epoch_from_now(
                     str_to_epoch(content[2])
                 )
-            self.server.set_ban(
+            await self.server_files.set_ban(
                 steamid64,
                 time_stamp=time_stamp,
                 ds_comment=content[3] if len(content) >= 4 else ''
@@ -81,7 +82,7 @@ async def get_ban(self, last_message):
     content_list = content.split(' ')
     steamid64 = content_list[1]
     if is_steamid64(steamid64):
-        response = self.server.is_banned(steamid64)
+        response = await self.server_files.get_ban(steamid64)
         await self.client.send_message(last_message.channel, response)
     else:
         await self.client.send_message(last_message.channel, 'Error: Must use a steamid64 user ID.')
@@ -98,6 +99,7 @@ async def rcon(self, last_message):
     """Passes the command to the rcon client, and returns the message from the server_scripts."""
     content = scrub_input(last_message.content)
     rcon_reply = await self.rcon.send_command(content)
+    print("RCON_REPLY TYPE", type(rcon_reply))
     await self.client.send_message(last_message.channel, rcon_reply)
 
 """ADMIN CONTROL"""
@@ -133,11 +135,13 @@ async def refresh_admins(self):
 
 """BASE ROUTINE"""
 
+
 async def standby(self):
     """ The default state of the bot, loops back after every command. Matches message to defined routines."""
     @self.client.event
     async def on_message(message):
-        if message.author.id != self.client.user.id and message.author.id in self.admins:
+        print(self.admins)
+        if (message.author.id != self.client.user.id and message.author.id in self.admins) or message.content.startswith('!vote '):
             if str(message.content).startswith(call_string):
                 self.client.send_message(message.channel, 'Entering standby routine.')
                 command = str(message.content).split(' ', 1)[0]
@@ -152,6 +156,64 @@ async def standby(self):
                 else:
                     await self.client.send_message(message.channel, 'Failed to interpret command. (Match < 50)')
 
+""""MAP VOTE"""
+
+
+async def vote(self, last_message):
+    content = scrub_input(last_message.content).split(' ', 1)[1]
+    if int(last_message.channel.id) == vote_channel_id:
+        try:
+            vote_int = int(content)
+            if vote_int < 1 or vote_int > 3:
+                raise ValueError
+            vote_int -= 1
+            try:
+                weight = 1
+                # Count premium roles as 2x
+                for role in last_message.author.roles:
+                    if role.id in premium_vote_roles:
+                        weight = 2
+                        break
+                # Handle vote
+                vote_info = await self.vote_map.add_vote(vote_int, weight, last_message.author.id)
+                await regen_vote_embed_msg(self, vote_info[0], vote_info[1])
+            except VoteError:
+                print("Invalid vote attempt, already voted.")
+                pass
+        except ValueError:
+            print("Invalid vote attempt, bad input.")
+
+
+def gen_vote_embed(title, data):
+    """Generates a map info vote embed"""
+    desc = str(data['votes'])
+    # SHIT WE'RE FANCY
+    if data['votes'] == 1:
+        desc += " vote"
+    else:
+        desc += " votes"
+    return dis.Embed(
+        title=title,
+        description=desc
+    ).set_image(url=data['image'])
+
+
+async def regen_vote_embed_msg(self, title, data):
+    """Regenerates a map vote embed in place"""
+    await self.client.edit_message(data['message'], embed=gen_vote_embed(title, data))
+
+async def init_voting_channel(self, channel_id):
+    """Purges vote channel, stores header and voting messages"""
+    vote_channel = self.client.get_channel(str(channel_id))
+    print('PURGING VOTE CHANNEL')
+    await self.client.purge_from(vote_channel, check=None)
+    self.vote_header = await self.client.send_message(vote_channel, content=vote_channel_header)
+    for layer, data in self.vote_map.layers.items():
+        self.vote_map.layers[layer]['message'] = await self.client.send_message(
+            vote_channel,
+            embed=gen_vote_embed(layer, data)
+        )
+    print(self.vote_map.layers)
 
 """BOT CLASS"""
 
@@ -168,7 +230,8 @@ class ServerBot:
         'setban': set_ban,
         'MakeAdmin': make_admin,
         'RemoveAdmin': remove_admin,
-        'RefreshAdmins': refresh_admins
+        'RefreshAdmins': refresh_admins,
+        'vote': vote
     }  # type : dict
 
     admins = parse_admins()
@@ -177,10 +240,12 @@ class ServerBot:
         'debug_message': debug_message
     }
 
-    def __init__(self, rcon, server_parser):
+    def __init__(self, rcon, server_files, vote_map):
         """ Initialize and run the bot."""
         self.rcon = rcon
-        self.server = server_parser
+        self.server_files = server_files
+        self.vote_map = vote_map
+        self.vote_header = ""
         @self.client.event
         async def on_ready():
             print('Logging in as: ' + self.client.user.name)
@@ -188,4 +253,5 @@ class ServerBot:
             rout = self.routines['standby']
 
             await validate_channels(self)
+            await init_voting_channel(self, vote_channel_id)
             await rout(self)

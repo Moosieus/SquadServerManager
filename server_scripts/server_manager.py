@@ -1,48 +1,44 @@
-from steam_scripts.update_listener import UpdateListener
 from squad_rcon.rcon import SquadRconClient
 from discord_bot.client import ServerBot
 from steam.game_servers import a2s_info
-from server_scripts.process_info import wait_for_process
 from server_config import *
-import asyncio, os, time, shutil
-from asyncio.subprocess import PIPE, STDOUT
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import asyncio, time
+from miscellaneous.random_layer_generator import generate_layer_list
+from server_scripts.vote_map import VoteMap
+from server_scripts.server_file_parser import SquadFileUtils
+
+from server_config import vote_channel_id
+from discord_bot.client import init_voting_channel
 
 
 class ServerManager:
     """Handles all inputs, data sources, and behaviors."""
-    def __init__(self, server=None):
+    def __init__(self):
+        print("Initializing Server Manager...")
         self.loop = asyncio.get_event_loop()
         self.tasks = []
-        self.server = server
-        self.process = wait_for_process(f"{self.server.path}\\Squad\\Binaries\\Win64\\SquadServer.exe")
-        if should_auto_update:
-            self.listener = UpdateListener(self.server.get_server_build_time(), self.server.get_client_build_time())
-            self.tasks.append(self.update_task)
+        self.server_files = SquadFileUtils()
+        print("Loaded Squad file utils.")
+        self.loop.run_until_complete(self.create_rcon())
+        if type(self.server_files.sq_ftp) is not bool:
+            self.tasks.append(self.server_files.sq_ftp.keep_alive)
 
-        if self.server.rcon_pass == "":
-            print("RCON is not enabled in Rcon.cfg (no password). Manager cannot run without RCON enabled.")
+        if self.rcon_dict['Password'] == "":
+            print("RCON is not enabled in Rcon.cfg (no password).")
             exit()
 
         self.rcon = SquadRconClient(
-            self.server.rcon_ip,
-            self.server.rcon_port,
-            self.server.rcon_pass
+            self.rcon_dict['IP'],
+            self.rcon_dict['Port'],
+            self.rcon_dict['Password']
         )
-
-        self.discord = ServerBot(self.rcon, self.server)
-
-        if should_restart:
-            self.scheduler = AsyncIOScheduler()
-            self.scheduler.add_job(
-                self.daily_restart,
-                trigger='cron',
-                hour=restart_hour,
-                minute=restart_minute
-            )
-            self.scheduler.start()
-            print("Will restart server in off hours.")
-
+        
+        self.vote_map = VoteMap(self.rcon, generate_layer_list, a2s_info((server_ip, query_port))['map'])
+        self.loop.run_until_complete(self.vote_map.evaluate_votes())
+        self.discord = ServerBot(self.rcon, self.server_files, self.vote_map)
+        self.tasks.append(self.broadcast_rules)
+        self.last_layer = a2s_info((server_ip, query_port))['map']
+        self.last_broadcast = round(time.time())
         """ASYNC LOOP"""
         try:
             self.loop.run_until_complete(
@@ -68,95 +64,28 @@ class ServerManager:
         finally:
             self.loop.close()
 
-    """TOP LEVEL FUNCTIONS"""
+    async def create_rcon(self):
+        self.rcon_dict = await self.server_files.get_rcon_info()
 
-    async def daily_restart(self):
-        """Restarts the server depending on population."""
-        if not wait_for_pop:
-            await self.restart_server_and_manager()
-        if a2s_info((server_ip, self.server.query_port))['players'] >= restart_pop_threshold:
-            await self.discord.func['debug_message'](f"Server still populated, delaying restart by {restart_pop_delay}")
-            self.scheduler.add_job(
-                self.daily_restart,
-                trigger='cron',
-                hour=restart_hour + int(restart_pop_delay / 60),
-                minute=restart_minute + int(restart_pop_delay % 60)
-            )
-        else:
-            await self.restart_server_and_manager()
-
-    async def download_server(self, steamcmd, path, app_id):
-        """Downloads the new version of the app to the specified folder. Returns stdout string or stderr string."""
-        process = await asyncio.create_subprocess_shell(
-            f'{steamcmd} +login anonymous +force_install_dir "{path}" +app_update {app_id} validate +quit',
-            stdin=PIPE,
-            stdout=PIPE,
-            stderr=STDOUT
-        )
-        stdout, stderr = await process.communicate()
-        if stderr is None:
-            print(stdout.decode().strip())
-        else:
-            print(stderr.decode().strip())
-
-    # I'm not confident that this feature will work quite yet.
-    async def update_task(self):
-        while not await self.listener.update_exists(403240):
-            await asyncio.sleep(60)
-        update_temp_path = f"{server_path}\\..\\_MANAGER_UPDATE"
-        dl_result = await self.download_server(steamcmd, update_temp_path, server_appid)
-        if dl_result.endswith(f"Success! App '{server_appid}' fully installed."):
-            await self.discord.func['debug_message']('New server update downloaded, waiting for client to be updated.')
-            # Wait for client to be pushed
-            while not await self.listener.update_exists(client_appid):
-                await asyncio.sleep(30)
-            # Broadcast to server that new client is released
-            self.rcon.send_command(f'adminbroadcast {update_broadcast_message}')
-            self.rcon.send_command(f'adminbroadcast {restart_broadcast_message}')
-            time.sleep(60)  # should this be blocking?
-            # Kill the server process
-            self.process.terminate()
-            # Update file operations
-            shutil.copyfile(f"{self.server.path}\\{self.server.start}", f"{update_temp_path}\\{self.server.start}")
-            shutil.rmtree(f"{update_temp_path}\\Squad\\ServerConfig")
-            shutil.copytree(f"{self.server.path}\\Squad\\ServerConfig", f"{update_temp_path}\\Squad\\ServerConfig")
-            shutil.move(self.server.path, f"{self.server.path}\\..\\old-server-backup")
-            shutil.move(f"{update_temp_path}", self.server.path)
-            self.start_server_and_exit()
-        else:
-            await self.discord.func['debug_message']('Error! Something went wrong downloading the update.')
-            await self.discord.func['debug_message']('steamcmd output:', dl_result)
-
-    """HELPFUL SHIT"""
-
-    async def close_discord_client(self):
-        asyncio.ensure_future(self.discord.client.logout(), loop=self.loop)
-
-    async def restart_server_and_manager(self):
-        """Kills the server and manager, and restarts both."""
-        await self.rcon.send_command(f'adminbroadcast {restart_broadcast_message}')
-        time.sleep(restart_warn_time * 60)  # Should this be blocking?
-        await self.close_discord_client()
-        print("Terminating process...")
-        self.process.terminate()
-        print("Restarting server...")
-        self.start_server_and_exit()
-
-    def start_server_and_exit(self):
-        # Magical directory adventure! Fix this.
-        h = os.getcwd()
-        os.chdir(self.server.path)
-        os.system(f'cmd.exe /c {self.server.start}')
-        os.chdir(h)
-        # Brute force solution
-        os.system(f'.\\venv\\Scripts\\activate.bat & python main.py')
-        exit()
-
-    async def is_server_running(self):
-        """Poorly named or badly implemented"""
-        if self.process.is_running():
+    async def broadcast_rules(self, interval=5):
+        if self.last_layer != a2s_info((server_ip, query_port))['map']:
+            print('NEW ROUND STARTED')
+            print('BROADCAST FOR NEW ROUND')
+            [await self.rcon.send_command(f'broadcast {msg}') for msg in rules_broadcasts]
+            print("RULE BROADCAST SUCCESSFUL")
             await asyncio.sleep(1)
-            await self.is_server_running()
+            self.last_layer = a2s_info((server_ip, query_port))['map']
+            self.last_broadcast = round(time.time())
+            self.vote_map.reinit(self.last_layer)
+            await self.vote_map.evaluate_votes()
+            await init_voting_channel(self.discord, vote_channel_id)
+
+        elif round(time.time())-(60*20) > self.last_broadcast:
+            print('BROADCAST FOR TIME DELTA')
+            [await self.rcon.send_command(f'broadcast {msg}') for msg in rules_broadcasts]
+            await asyncio.sleep(1)
+            self.last_broadcast = round(time.time())
+
         else:
-            print("Server process is not running! Has the server crashed?")  # send to discord bot instead.
-            await self.restart_server()  # PLS FIX
+            await asyncio.sleep(interval)
+        await self.broadcast_rules()

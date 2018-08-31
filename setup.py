@@ -11,8 +11,7 @@ setup(
         'discord.py',
         'steam',
         'aiorcon',
-        'psutil',
         'fuzzywuzzy[speedup]',
-        'apscheduler'
+        'paramiko'
     ]
 )

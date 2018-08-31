@@ -3,8 +3,11 @@ from aiorcon.rcon import RCON
 from fuzzywuzzy import fuzz
 from squad_rcon.commands import commands
 
+
 def doNothing(*args):
+    """Callback method for aiorcon."""
     return False
+
 
 class SquadRconClient:
     """Simple command checks to ensure rcon is not passed invalid commands."""
@@ -13,7 +16,7 @@ class SquadRconClient:
         print("Starting rcon...")
         loop.run_until_complete(self.setup_rcon(ip, port, password, timeout=timeout))
         print("Rcon connected!")
-        loop.run_until_complete(self.rcon('ListPlayers'))
+        loop.run_until_complete(self.rcon('ShowNextMap'))
 
     async def setup_rcon(self, ip, port, password, timeout=5):
         """RCON setup must be asynchronous, cannot be ran in __init__."""
@@ -46,7 +49,7 @@ class SquadRconClient:
         try:
             return await self.rcon(revised_request)
         except TypeError:
-            return 'Command was sent but yielded no return. Command may or may not have worked.'
+            return 'Command was sent but yielded no return.'
 
     async def direct_command(self, request):
         """Execute a squad_rcon command, ensuring the command exists."""

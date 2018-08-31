@@ -18,15 +18,12 @@ Issue commands over the bot, or configure behaviors in `server_config.py`
 + Allow RCON access to the server over discord, with an easy to use interface (read `bot help.md` for details, or use ...help)
 + Edit and view bans from the server's Bans.cfg file, allowing users to retrieve bans, and to modify them.
 
-### Things I hope to implement:
- + Make a better permissions system for discord
- + Log all interactions with the discord bot
- + Automatic restarts on server crashes
- + Auto install workshop content to a server
- + Automatic broadcasts on certain events
- + Enable voting for maps
- + Allow Discord bot to whitelist players
- + Enable users to easily add their own code and behaviors
- + Network monitoring via psutil
- + Track player count and hardware level network data
- + Warn about potential misconfiguration in server files
+### Features:
+ + RCON commands over discord
+ + Read log file over FTP?
+ + Access bans in Discord
+### Access points:
+ + RCON
+ + a2s queries
+ + FTP access
+ + 
